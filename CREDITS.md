@@ -1,6 +1,6 @@
 # Credits
 
-This project is my own work, but it stands on open-source libraries:
+This project is my own work (© 2026 Dimitres Kisimov, all rights reserved), but it stands on open-source libraries:
 
 - [NumPy](https://numpy.org/) — array math, the PCA-SVD detector, FFT features (BSD-3)
 - [SciPy](https://scipy.org/) — signal filtering and rank statistics (BSD-3)

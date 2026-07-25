@@ -101,6 +101,6 @@ autoencoder tests skip via `importorskip` and the numpy-based suite still gates.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Credits for the libraries I built on are in
+© 2026 Dimitres Kisimov — all rights reserved; published for portfolio review. See LICENSE. Credits for the libraries I built on are in
 [CREDITS.md](CREDITS.md). The business framing is in
 [docs/BUSINESS_CASE.md](docs/BUSINESS_CASE.md).
