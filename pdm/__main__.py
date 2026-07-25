@@ -1,0 +1,62 @@
+"""CLI entry point: `python -m pdm` (analysis summary) / `--deliverables` (PDF+Excel)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(prog="pdm", description=__doc__)
+    ap.add_argument("--deliverables", action="store_true", help="write PDF + Excel deliverables")
+    ap.add_argument("--outdir", default="deliverables", help="output directory")
+    args = ap.parse_args(argv)
+
+    from pdm.exports import build_deliverables
+    from pdm.pipeline import run_pipeline
+
+    print("[pdm] running pipeline on the synthetic seeded fleet (no real telemetry)")
+    result = run_pipeline()
+    cfg = result.data.config
+    print(
+        f"[data] {cfg.n_machines} machines x {cfg.n_days} days, seed {cfg.seed}, "
+        f"{len(result.data.faulty_machines())} machines with injected faults"
+    )
+    for name, rep in result.reports.items():
+        print(
+            f"[detect] {name}: ROC-AUC {rep.roc_auc:.3f}  PR-AUC {rep.pr_auc:.3f}  "
+            f"precision@{rep.k} {rep.precision_at_k:.3f}  "
+            f"detected {rep.n_detected}/{rep.n_faulty}  "
+            f"mean delay {rep.mean_delay_days:.1f} d  val FPR {rep.val_fpr:.1%}"
+        )
+    margin = "n/a" if result.margin != result.margin else f"{result.margin:+.4f}"
+    print(f"[detect] recommended: {result.recommended} (AE - PCA PR-AUC margin: {margin})")
+    top = result.health.ranking[:5]
+    tops = ", ".join(f"M{m:02d}({result.health.final[m]:.0f})" for m in top)
+    print(f"[health] most urgent (heuristic degradation score, not RUL): {tops}")
+    sched = result.schedule
+    print(
+        f"[schedule] CP-SAT {sched.optimized.status}: weighted delay "
+        f"{sched.optimized.weighted_delay} vs FIFO {sched.fifo.weighted_delay} "
+        f"(-{sched.reduction_pct:.1f}%)"
+    )
+
+    if args.deliverables:
+        sizes = build_deliverables(result, args.outdir)
+        ok = True
+        for path, size in sizes.items():
+            status = "OK" if size > 10 * 1024 else "TOO SMALL"
+            if size <= 10 * 1024:
+                ok = False
+            print(f"[deliverable] {Path(path).name}: {size / 1024:.1f} KiB [{status}]")
+        if not ok:
+            print("[fail] a deliverable is under 10 KiB")
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

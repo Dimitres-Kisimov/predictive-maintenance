@@ -1,0 +1,369 @@
+"""Executive deliverables: PDF report (matplotlib PdfPages) + Excel workbook.
+
+The PDF cover carries the synthetic-data disclaimer and the headline numbers;
+inner pages show the detector comparison (PR curves), the health-index ranking
+and the before/after maintenance schedule. The Excel workbook has Machines,
+Alerts, HealthIndex, Schedule and Comparison sheets.
+
+Chart styling follows a validated light-surface palette: categorical slots
+blue #2a78d6 / green #008300 (fixed order), muted ink for axes, hairline grid.
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
+from openpyxl import Workbook  # noqa: E402
+from openpyxl.styles import Font  # noqa: E402
+
+from pdm.data import FAULT_HEALTHY  # noqa: E402
+from pdm.pipeline import PipelineResult  # noqa: E402
+from pdm.schedule import ScheduleResult  # noqa: E402
+
+INK = "#0b0b0b"
+INK_2 = "#52514e"
+MUTED = "#898781"
+GRID = "#e1e0d9"
+BASELINE = "#c3c2b7"
+SERIES_1 = "#2a78d6"  # blue — PCA / primary
+SERIES_2 = "#008300"  # green — autoencoder
+SURFACE = "#fcfcfb"
+
+DISCLAIMER = (
+    "All data in this report is SYNTHETIC, produced by a seeded generator\n"
+    "(pdm/data.py). No real plant telemetry was used. The health index is a\n"
+    "heuristic degradation score, not a certified remaining-useful-life\n"
+    "prediction. Detector metrics are measured against the generator's\n"
+    "ground-truth fault labels."
+)
+
+
+def _style_axis(ax) -> None:
+    ax.set_facecolor(SURFACE)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(BASELINE)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.grid(True, color=GRID, linewidth=0.6, alpha=0.9)
+    ax.set_axisbelow(True)
+
+
+def _fmt(x: float, digits: int = 3) -> str:
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "n/a"
+    return f"{x:.{digits}f}"
+
+
+def _cover_page(pdf: PdfPages, result: PipelineResult) -> None:
+    fig = plt.figure(figsize=(8.27, 11.69))
+    fig.patch.set_facecolor(SURFACE)
+    rec = result.reports[result.recommended]
+    sched = result.schedule
+    fig.text(0.08, 0.90, "Predictive Maintenance Report", fontsize=22, color=INK, weight="bold")
+    fig.text(
+        0.08,
+        0.865,
+        "Sensor anomaly detection + optimized maintenance scheduling (synthetic fleet)",
+        fontsize=11,
+        color=INK_2,
+    )
+    lines = [
+        ("Recommended detector", result.recommended.upper()),
+        ("  ROC-AUC / PR-AUC", f"{_fmt(rec.roc_auc)} / {_fmt(rec.pr_auc)}"),
+        (
+            "  Machines detected",
+            f"{rec.n_detected}/{rec.n_faulty}"
+            f" (mean {_fmt(rec.mean_delay_days, 1)} days after true onset)",
+        ),
+        (
+            "  Threshold",
+            f"{rec.fpr_budget:.0%} FPR budget (measured {rec.val_fpr:.1%})",
+        ),
+        (
+            "Schedule vs FIFO baseline",
+            f"-{sched.reduction_pct:.1f}% weighted delay"
+            f" ({sched.fifo.weighted_delay} -> {sched.optimized.weighted_delay})",
+        ),
+        ("  Solver status", f"CP-SAT {sched.optimized.status}"),
+        (
+            "Fleet",
+            f"{result.data.config.n_machines} machines x {result.data.n_days} days,"
+            f" {len(result.data.faulty_machines())} with injected faults",
+        ),
+    ]
+    y = 0.78
+    for label, value in lines:
+        fig.text(0.08, y, label, fontsize=11, color=INK_2)
+        fig.text(0.40, y, value, fontsize=11, color=INK, weight="bold")
+        y -= 0.035
+    fig.text(0.08, 0.30, "Data disclaimer", fontsize=12, color=INK, weight="bold")
+    fig.text(0.08, 0.22, DISCLAIMER, fontsize=9, color=INK_2, linespacing=1.6)
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _detector_page(pdf: PdfPages, result: PipelineResult) -> None:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.69, 5.5))
+    fig.patch.set_facecolor(SURFACE)
+    colors = {"pca": SERIES_1, "autoencoder": SERIES_2}
+    for name, rep in result.reports.items():
+        if rep.recall_curve.size:
+            ax1.plot(
+                rep.recall_curve,
+                rep.precision_curve,
+                color=colors.get(name, SERIES_1),
+                linewidth=2,
+                label=f"{name} (PR-AUC {_fmt(rep.pr_auc)})",
+            )
+    ax1.set_xlabel("Recall", color=INK_2)
+    ax1.set_ylabel("Precision", color=INK_2)
+    ax1.set_title("Precision-recall on held-out machine-days", color=INK, fontsize=11)
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, 1.02)
+    _style_axis(ax1)
+    ax1.legend(frameon=False, fontsize=9, labelcolor=INK_2)
+
+    metric_names = ["ROC-AUC", "PR-AUC", "precision@k"]
+    width = 0.35
+    for i, (name, rep) in enumerate(result.reports.items()):
+        vals = [rep.roc_auc, rep.pr_auc, rep.precision_at_k]
+        xs = [j + (i - 0.5) * width for j in range(len(metric_names))]
+        bars = ax2.bar(
+            xs, vals, width=width * 0.94, color=colors.get(name, SERIES_1), label=name
+        )
+        for b, v in zip(bars, vals, strict=True):
+            ax2.text(
+                b.get_x() + b.get_width() / 2,
+                v + 0.015,
+                _fmt(v),
+                ha="center",
+                fontsize=8,
+                color=INK_2,
+            )
+    ax2.set_xticks(range(len(metric_names)))
+    ax2.set_xticklabels(metric_names, color=INK_2)
+    ax2.set_ylim(0, 1.1)
+    ax2.set_title(
+        f"Detector comparison (recommended: {result.recommended})", color=INK, fontsize=11
+    )
+    _style_axis(ax2)
+    ax2.legend(frameon=False, fontsize=9, labelcolor=INK_2)
+    fig.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _health_page(pdf: PdfPages, result: PipelineResult) -> None:
+    fig, ax = plt.subplots(figsize=(11.69, 6.5))
+    fig.patch.set_facecolor(SURFACE)
+    order = result.health.ranking
+    truth = {lab.machine: lab.fault_type for lab in result.data.labels}
+    names = [f"M{m:02d}" for m in order]
+    vals = [result.health.final[m] for m in order]
+    ys = range(len(order))
+    ax.barh(ys, vals, color=SERIES_1, height=0.62)
+    for y, m, v in zip(ys, order, vals, strict=True):
+        tag = truth[m]
+        note = "" if tag == FAULT_HEALTHY else f"  (true fault: {tag})"
+        ax.text(v + 1.0, y, f"{v:.0f}{note}", va="center", fontsize=8, color=INK_2)
+    ax.set_yticks(list(ys))
+    ax.set_yticklabels(names, color=INK_2, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 118)
+    ax.set_xlabel("Health index (100 = healthy) - heuristic degradation score, not RUL", color=INK_2)
+    ax.set_title("Fleet health ranking (most urgent first)", color=INK, fontsize=11)
+    _style_axis(ax)
+    fig.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _gantt(ax, sched: ScheduleResult, n_crews: int, n_days: int, day_hours: int, title: str):
+    for a in sched.assignments:
+        x = a.day * day_hours + a.start_h
+        ax.broken_barh(
+            [(x, a.duration_h)],
+            (a.crew - 0.3, 0.6),
+            facecolors=SERIES_1,
+            edgecolor=SURFACE,
+            linewidth=1.5,
+        )
+        ax.text(
+            x + a.duration_h / 2,
+            a.crew,
+            f"M{a.machine:02d}",
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=SURFACE,
+            weight="bold",
+        )
+    for d in range(1, n_days):
+        ax.axvline(d * day_hours, color=BASELINE, linewidth=0.8, linestyle="--")
+    ax.set_yticks(range(n_crews))
+    ax.set_yticklabels([f"Crew {c + 1}" for c in range(n_crews)], color=INK_2, fontsize=9)
+    ax.set_ylim(-0.7, n_crews - 0.3)
+    ax.set_xlim(0, n_days * day_hours)
+    ax.set_xlabel("Working hours from start of horizon (dashed = day boundary)", color=INK_2)
+    ax.set_title(title, color=INK, fontsize=10)
+    _style_axis(ax)
+    ax.grid(axis="y", visible=False)
+
+
+def _schedule_page(pdf: PdfPages, result: PipelineResult) -> None:
+    sched = result.schedule
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11.69, 7.0))
+    fig.patch.set_facecolor(SURFACE)
+    _gantt(
+        ax1,
+        sched.fifo,
+        sched.n_crews,
+        sched.n_days,
+        sched.day_hours,
+        f"FIFO baseline - weighted delay {sched.fifo.weighted_delay}",
+    )
+    _gantt(
+        ax2,
+        sched.optimized,
+        sched.n_crews,
+        sched.n_days,
+        sched.day_hours,
+        f"CP-SAT optimized ({sched.optimized.status}) - weighted delay "
+        f"{sched.optimized.weighted_delay} ({sched.reduction_pct:.1f}% lower)",
+    )
+    fig.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def export_pdf(result: PipelineResult, path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(path) as pdf:
+        _cover_page(pdf, result)
+        _detector_page(pdf, result)
+        _health_page(pdf, result)
+        _schedule_page(pdf, result)
+    return path
+
+
+def _sheet(wb: Workbook, title: str, header: list[str], rows: list[list]) -> None:
+    ws = wb.create_sheet(title)
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for row in rows:
+        ws.append(row)
+    ws.freeze_panes = "A2"
+
+
+def export_excel(result: PipelineResult, path: str | Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    truth = {lab.machine: (lab.fault_type, lab.onset_day) for lab in result.data.labels}
+    rank_pos = {m: i + 1 for i, m in enumerate(result.health.ranking)}
+    _sheet(
+        wb,
+        "Machines",
+        ["machine", "true_fault_type", "true_onset_day", "final_health", "urgency", "rank"],
+        [
+            [
+                m,
+                truth[m][0],
+                truth[m][1],
+                round(float(result.health.final[m]), 2),
+                round(float(result.health.urgency[m]), 2),
+                rank_pos[m],
+            ]
+            for m in range(result.data.config.n_machines)
+        ],
+    )
+    _sheet(
+        wb,
+        "Alerts",
+        ["machine", "day", "score", "threshold", "flagged_on"],
+        [
+            [a.machine, a.day, round(a.score, 5), round(result.chosen_threshold, 5),
+             " + ".join(a.sensors)]
+            for a in result.alerts
+        ],
+    )
+    _sheet(
+        wb,
+        "HealthIndex",
+        ["machine", "day", "anomaly_score", "health"],
+        [
+            [m, int(d), round(float(result.chosen_scores[m, i]), 5),
+             round(float(result.health.health[m, i]), 2)]
+            for m in range(result.data.config.n_machines)
+            for i, d in enumerate(result.features.days)
+        ],
+    )
+    weights = {j.machine: j.weight for j in result.schedule.jobs}
+    sched_rows = []
+    for plan, res in (("FIFO", result.schedule.fifo), ("OPTIMIZED", result.schedule.optimized)):
+        for a in res.assignments:
+            sched_rows.append(
+                [plan, a.machine, a.crew + 1, a.day + 1, a.start_h, a.duration_h,
+                 a.completion_h, weights[a.machine]]
+            )
+    _sheet(
+        wb,
+        "Schedule",
+        ["plan", "machine", "crew", "day", "start_hour", "duration_h",
+         "completion_h", "urgency_weight"],
+        sched_rows,
+    )
+    comp_rows = [
+        ["data", "synthetic seeded generator (pdm/data.py); no real telemetry", ""],
+        ["health index", "heuristic degradation score, NOT certified RUL", ""],
+        ["", "", ""],
+        ["metric", "pca", "autoencoder"],
+    ]
+    ae = result.reports.get("autoencoder")
+    pca = result.reports["pca"]
+    for label, attr in (
+        ("roc_auc", "roc_auc"),
+        ("pr_auc", "pr_auc"),
+        ("precision_at_k", "precision_at_k"),
+        ("mean_delay_days", "mean_delay_days"),
+        ("machines_detected", "n_detected"),
+        ("val_fpr", "val_fpr"),
+    ):
+        pv = getattr(pca, attr)
+        av = getattr(ae, attr) if ae else "n/a"
+        comp_rows.append([label, round(pv, 4) if isinstance(pv, float) else pv,
+                          round(av, 4) if isinstance(av, float) else av])
+    comp_rows += [
+        ["recommended", result.recommended,
+         f"margin (ae - pca PR-AUC): {'n/a' if ae is None else round(result.margin, 4)}"],
+        ["", "", ""],
+        ["schedule", "FIFO baseline", "CP-SAT"],
+        ["weighted_delay", result.schedule.fifo.weighted_delay,
+         result.schedule.optimized.weighted_delay],
+        ["reduction_pct", "", round(result.schedule.reduction_pct, 2)],
+        ["solver_status", "", result.schedule.optimized.status],
+    ]
+    _sheet(wb, "Comparison", ["item", "value_a", "value_b"], comp_rows)
+
+    wb.save(path)
+    return path
+
+
+def build_deliverables(result: PipelineResult, outdir: str | Path) -> dict[str, int]:
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    pdf = export_pdf(result, outdir / "pdm_report.pdf")
+    xlsx = export_excel(result, outdir / "pdm_workbook.xlsx")
+    return {str(pdf): pdf.stat().st_size, str(xlsx): xlsx.stat().st_size}
