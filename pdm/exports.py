@@ -23,9 +23,12 @@ from matplotlib.backends.backend_pdf import PdfPages  # noqa: E402
 from openpyxl import Workbook  # noqa: E402
 from openpyxl.styles import Font  # noqa: E402
 
+from pdm.alert_economics import AlertEconomics, curve_rows, economics_from_result  # noqa: E402
 from pdm.data import FAULT_HEALTHY  # noqa: E402
 from pdm.pipeline import PipelineResult  # noqa: E402
 from pdm.schedule import ScheduleResult  # noqa: E402
+
+SERIES_3 = "#c25a00"  # amber — the detector's current operating threshold
 
 INK = "#0b0b0b"
 INK_2 = "#52514e"
@@ -244,14 +247,66 @@ def _schedule_page(pdf: PdfPages, result: PipelineResult) -> None:
     plt.close(fig)
 
 
+def _alert_economics_page(pdf: PdfPages, econ: AlertEconomics) -> None:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.69, 5.5))
+    fig.patch.set_facecolor(SURFACE)
+    pts = sorted(econ.points, key=lambda p: p.alerts_per_period)
+    load = [p.alerts_per_period for p in pts]
+
+    # left: expected-cost curve vs analyst load, with the two operating points
+    ax1.plot([p.alerts_per_period for p in pts], [p.expected_cost for p in pts],
+             color=SERIES_1, linewidth=2)
+    b = econ.best
+    ax1.scatter([b.alerts_per_period], [b.expected_cost], color=SERIES_2, zorder=5, s=45,
+                label=f"cost-optimal (thr {b.threshold:.3f})")
+    if econ.current is not None:
+        c = econ.current
+        ax1.scatter([c.alerts_per_period], [c.expected_cost], color=SERIES_3, zorder=5, s=45,
+                    label=f"current 5% FPR (thr {c.threshold:.3f})")
+    ax1.set_xlabel("Alerts per day (analyst workload -> alert fatigue)", color=INK_2)
+    ax1.set_ylabel(f"Expected cost ({econ.cost.unit})", color=INK_2)
+    ax1.set_title("Cost vs analyst load (ILLUSTRATIVE costs)", color=INK, fontsize=11)
+    _style_axis(ax1)
+    ax1.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+
+    # right: the coverage/fatigue trade-off — missed failures and false alarms vs load
+    ax2.plot(load, [p.missed_failures for p in pts], color=SERIES_1, linewidth=2,
+             label="missed failure-days")
+    ax2.plot(load, [p.fp for p in pts], color=SERIES_2, linewidth=2, label="false alarms")
+    ax2.axvline(b.alerts_per_period, color=SERIES_2, linewidth=1, linestyle="--", alpha=0.7)
+    if econ.current is not None:
+        ax2.axvline(econ.current.alerts_per_period, color=SERIES_3, linewidth=1,
+                    linestyle="--", alpha=0.7)
+    ax2.set_xlabel("Alerts per day", color=INK_2)
+    ax2.set_ylabel("Count over the test window", color=INK_2)
+    ax2.set_title("Coverage vs fatigue trade-off", color=INK, fontsize=11)
+    _style_axis(ax2)
+    ax2.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+
+    note = (
+        f"SYNTHETIC data; cost rates ILLUSTRATIVE (missed failure = "
+        f"{econ.cost.cost_missed_failure:g}, false alarm = {econ.cost.cost_false_alarm:g}, "
+        f"ratio {econ.cost.ratio:g}:1) — not a business guarantee. Cost-minimising threshold "
+        f"moves with the ratio."
+    )
+    fig.text(0.08, 0.02, note, fontsize=8, color=MUTED)
+    fig.suptitle("Alert-threshold economics / alert-fatigue analysis", fontsize=13,
+                 color=INK, weight="bold", x=0.08, ha="left")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def export_pdf(result: PipelineResult, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    econ = economics_from_result(result)
     with PdfPages(path) as pdf:
         _cover_page(pdf, result)
         _detector_page(pdf, result)
         _health_page(pdf, result)
         _schedule_page(pdf, result)
+        _alert_economics_page(pdf, econ)
     return path
 
 
@@ -356,6 +411,36 @@ def export_excel(result: PipelineResult, path: str | Path) -> Path:
         ["solver_status", "", result.schedule.optimized.status],
     ]
     _sheet(wb, "Comparison", ["item", "value_a", "value_b"], comp_rows)
+
+    econ = economics_from_result(result)
+    econ_rows = [
+        ["# SYNTHETIC data; cost rates are ILLUSTRATIVE assumptions, not a business guarantee",
+         "", "", "", "", "", "", ""],
+        [f"cost_missed_failure={econ.cost.cost_missed_failure:g}",
+         f"cost_false_alarm={econ.cost.cost_false_alarm:g}",
+         f"ratio={econ.cost.ratio:g}:1", "", "", "", "", ""],
+    ]
+    for p in curve_rows(econ):
+        note = "cost-optimal" if p.threshold == econ.best.threshold else ""
+        if econ.current is not None and p.threshold == econ.current.threshold:
+            note = (note + "+current").strip("+")
+        econ_rows.append([
+            round(p.threshold, 5),
+            round(p.precision, 4) if p.precision == p.precision else "n/a",
+            round(p.recall, 4) if p.recall == p.recall else "n/a",
+            p.alerts,
+            round(p.alerts_per_period, 3),
+            p.missed_failures,
+            round(p.expected_cost, 1),
+            note,
+        ])
+    _sheet(
+        wb,
+        "AlertEconomics",
+        ["threshold", "precision", "recall", "alerts", "alerts_per_day",
+         "missed_failures", "expected_cost", "note"],
+        econ_rows,
+    )
 
     wb.save(path)
     return path

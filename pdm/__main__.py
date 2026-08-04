@@ -13,8 +13,15 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="pdm", description=__doc__)
     ap.add_argument("--deliverables", action="store_true", help="write PDF + Excel deliverables")
     ap.add_argument("--outdir", default="deliverables", help="output directory")
+    ap.add_argument(
+        "--alert-econ-out",
+        default=None,
+        metavar="DIR",
+        help="(re)write DIR/alert_economics.{csv,svg} reference artifacts (e.g. docs)",
+    )
     args = ap.parse_args(argv)
 
+    from pdm.alert_economics import build_reference_artifacts, economics_from_result
     from pdm.exports import build_deliverables
     from pdm.pipeline import run_pipeline
 
@@ -43,6 +50,27 @@ def main(argv: list[str] | None = None) -> int:
         f"{sched.optimized.weighted_delay} vs FIFO {sched.fifo.weighted_delay} "
         f"(-{sched.reduction_pct:.1f}%)"
     )
+
+    econ = economics_from_result(result)
+    b = econ.best
+    print(
+        f"[alert-econ] ILLUSTRATIVE costs (missed:false = {econ.cost.ratio:g}:1) -> "
+        f"cost-optimal threshold {b.threshold:.4f}: {b.alerts_per_period:.2f} alerts/day, "
+        f"{b.missed_failures}/{econ.n_positives} failure-days missed, "
+        f"P/R {b.precision:.2f}/{b.recall:.2f}"
+    )
+    if econ.current is not None:
+        cur = econ.current
+        print(
+            f"[alert-econ] current 5%-FPR threshold {cur.threshold:.4f}: "
+            f"{cur.alerts_per_period:.2f} alerts/day, {cur.missed_failures} missed "
+            f"(synthetic data; costs illustrative, not a business guarantee)"
+        )
+
+    if args.alert_econ_out:
+        paths = build_reference_artifacts(result, args.alert_econ_out)
+        for kind, p in paths.items():
+            print(f"[alert-econ] wrote {kind}: {p}")
 
     if args.deliverables:
         sizes = build_deliverables(result, args.outdir)
