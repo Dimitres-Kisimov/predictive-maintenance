@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 
@@ -26,6 +27,7 @@ from openpyxl.styles import Font  # noqa: E402
 from pdm.alert_economics import AlertEconomics, curve_rows, economics_from_result  # noqa: E402
 from pdm.data import FAULT_HEALTHY  # noqa: E402
 from pdm.pipeline import PipelineResult  # noqa: E402
+from pdm.rul import RULEvaluation, evaluate_rul  # noqa: E402
 from pdm.schedule import ScheduleResult  # noqa: E402
 
 SERIES_3 = "#c25a00"  # amber — the detector's current operating threshold
@@ -297,16 +299,80 @@ def _alert_economics_page(pdf: PdfPages, econ: AlertEconomics) -> None:
     plt.close(fig)
 
 
+def _rul_page(pdf: PdfPages, ev: RULEvaluation) -> None:
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.69, 5.5))
+    fig.patch.set_facecolor(SURFACE)
+    c = ev.config
+    axis_top = max(float(ev.true_rul.max()), float(ev.pred_rul.max()), 1.0) * 1.05
+
+    # left: predicted vs true RUL with the ideal line and the alpha-lambda cone
+    ft = {mr.machine: mr.fault_type for mr in ev.machines}
+    is_accel = np.array([ft[int(m)] == "accelerating_drift" for m in ev.sample_machine])
+    ax1.plot([0, axis_top], [0, axis_top], color=MUTED, linewidth=1.2, linestyle="--",
+             label="ideal")
+    grid = np.linspace(0, axis_top, 50)
+    ax1.fill_between(grid, np.clip(grid - (c.alpha * grid + c.alpha_floor_days), 0, None),
+                     grid + (c.alpha * grid + c.alpha_floor_days), color=SERIES_2, alpha=0.08,
+                     label=f"+/-({c.alpha:g}*RUL+{c.alpha_floor_days:g}d) cone")
+    ax1.scatter(ev.true_rul[~is_accel], ev.pred_rul[~is_accel], s=18, color=SERIES_1,
+                alpha=0.75, label="slow_drift")
+    ax1.scatter(ev.true_rul[is_accel], ev.pred_rul[is_accel], s=18, color=SERIES_2,
+                alpha=0.75, label="accelerating_drift")
+    ax1.set_xlim(0, axis_top)
+    ax1.set_ylim(0, axis_top)
+    ax1.set_xlabel("True RUL (days to failure)", color=INK_2)
+    ax1.set_ylabel("Predicted RUL (days)", color=INK_2)
+    ax1.set_title("Predicted vs true RUL (leave-one-machine-out)", color=INK, fontsize=11)
+    _style_axis(ax1)
+    ax1.legend(frameon=False, fontsize=8, labelcolor=INK_2)
+
+    # right: headline metrics as a small table
+    ax2.axis("off")
+    rows = [
+        ("MAE", f"{ev.mae:.2f} d"),
+        ("RMSE", f"{ev.rmse:.2f} d"),
+        ("naive-mean baseline MAE", f"{ev.baseline_mae:.2f} d"),
+        (f"MAE (RUL <= {c.horizon_days} d)", f"{ev.mae_within_horizon:.2f} d"),
+        (f"alpha-accuracy (alpha={c.alpha:g})", f"{ev.alpha_accuracy:.2f}"),
+        ("mean prognostic horizon", f"{ev.mean_prognostic_horizon:.1f} d"),
+        ("scored machine-days", f"{ev.n_samples}"),
+        ("machines (progressive faults)", f"{ev.n_machines}"),
+    ]
+    y = 0.92
+    ax2.text(0.0, y, "Remaining-useful-life accuracy", fontsize=12, color=INK, weight="bold",
+             transform=ax2.transAxes)
+    y -= 0.10
+    for label, value in rows:
+        ax2.text(0.0, y, label, fontsize=10, color=INK_2, transform=ax2.transAxes)
+        ax2.text(0.72, y, value, fontsize=10, color=INK, weight="bold", transform=ax2.transAxes)
+        y -= 0.075
+    note = (
+        f"SYNTHETIC data. Failure level is ILLUSTRATIVE ({c.vib_rise:g} mm/s of induced "
+        f"vibration rise), not a measured engineering limit; day counts scale with it. The "
+        f"predictor reuses the recommended detector's own risk score and never sees the true "
+        f"onset. Progressive faults (slow_drift, accelerating_drift) only."
+    )
+    ax2.text(0.0, 0.06, note, fontsize=7.5, color=MUTED, transform=ax2.transAxes, wrap=True)
+
+    fig.suptitle("Remaining-useful-life (RUL) estimation", fontsize=13, color=INK,
+                 weight="bold", x=0.08, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
 def export_pdf(result: PipelineResult, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     econ = economics_from_result(result)
+    rul = evaluate_rul(result)
     with PdfPages(path) as pdf:
         _cover_page(pdf, result)
         _detector_page(pdf, result)
         _health_page(pdf, result)
         _schedule_page(pdf, result)
         _alert_economics_page(pdf, econ)
+        _rul_page(pdf, rul)
     return path
 
 
@@ -440,6 +506,36 @@ def export_excel(result: PipelineResult, path: str | Path) -> Path:
         ["threshold", "precision", "recall", "alerts", "alerts_per_day",
          "missed_failures", "expected_cost", "note"],
         econ_rows,
+    )
+
+    ev = evaluate_rul(result)
+    rul_rows = [
+        ["# SYNTHETIC data; failure level is ILLUSTRATIVE, not a measured engineering limit",
+         "", "", "", "", ""],
+        [f"failure_vib_rise={ev.config.vib_rise:g}mm/s",
+         f"model=log1p(RUL)=a+b*severity (a={ev.coef[0]:.3f}, b={ev.coef[1]:.3f})",
+         "leave-one-machine-out", "", "", ""],
+        ["metric", "value", "", "", "", ""],
+        ["MAE_days", round(ev.mae, 3), "", "", "", ""],
+        ["RMSE_days", round(ev.rmse, 3), "", "", "", ""],
+        ["naive_mean_baseline_MAE_days", round(ev.baseline_mae, 3), "", "", "", ""],
+        [f"MAE_within_{ev.config.horizon_days}d", round(ev.mae_within_horizon, 3), "", "", "", ""],
+        [f"alpha{ev.config.alpha:g}_accuracy", round(ev.alpha_accuracy, 3), "", "", "", ""],
+        ["mean_prognostic_horizon_days", round(ev.mean_prognostic_horizon, 2), "", "", "", ""],
+        ["scored_machine_days", ev.n_samples, "", "", "", ""],
+        ["", "", "", "", "", ""],
+        ["per-machine (held-out)", "", "", "", "", ""],
+        ["machine", "fault_type", "onset_day", "failure_day", "scored_days", "mae_days"],
+    ]
+    for mr in ev.machines:
+        rul_rows.append(
+            [mr.machine, mr.fault_type, mr.onset_day, mr.failure_day, mr.n_days, round(mr.mae, 3)]
+        )
+    _sheet(
+        wb,
+        "RUL",
+        ["item", "value_b", "value_c", "value_d", "value_e", "value_f"],
+        rul_rows,
     )
 
     wb.save(path)

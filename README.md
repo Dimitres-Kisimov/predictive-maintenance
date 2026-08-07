@@ -36,7 +36,16 @@ This repo does both, end to end.
   budget. Per-feature error explains each alert ("flagged on vibration + temperature").
 - `pdm/health.py` — a per-machine health index (0-100) from the smoothed anomaly-score
   trend. **This is a heuristic degradation score, not a certified remaining-useful-life
-  prediction**, and it is labelled that way everywhere it appears.
+  prediction**, and it is labelled that way everywhere it appears. The actual
+  time-to-failure model lives in `pdm/rul.py`.
+- `pdm/rul.py` — remaining-useful-life (RUL) estimation, evaluated against a
+  ground-truth failure day rather than asserted. For the two progressive-degradation
+  fault kinds it reuses the recommended detector's *own* risk score (EWMA-smoothed,
+  expressed as a log-scale exceedance over the alert threshold) and maps it to
+  days-to-failure with a one-feature log-linear model. Scored **leave-one-machine-out**
+  (each machine predicted by a fit that never saw it) with MAE/RMSE in days, a naive
+  mean-RUL baseline, a near-failure error, and the alpha-lambda accuracy cone. The
+  failure *level* is an illustrative synthetic assumption, labelled as such.
 - `pdm/schedule.py` — CP-SAT maintenance scheduling: urgency-weighted jobs, 2 crews,
   8-hour day windows, no overlap per crew, minimizing total weighted delay. Compared
   against a named FIFO baseline (jobs in request order, earliest-free crew).
@@ -107,15 +116,65 @@ the full sweep is in [docs/alert_economics.csv](docs/alert_economics.csv); both 
 also folded into the PDF report (a cost-curve page) and the Excel workbook (an
 `AlertEconomics` sheet). Regenerate them with `python -m pdm --alert-econ-out docs`.
 
+## Remaining-useful-life (RUL) estimation
+
+The health index above is deliberately only a heuristic urgency ranking. `pdm/rul.py`
+is the actual prognostics layer: it predicts *days to failure* and is **evaluated
+against a ground-truth failure day** instead of asserted.
+
+Two of the injected fault kinds — `slow_drift` and `accelerating_drift` — degrade
+monotonically, so a failure day is well defined: `PlantData.failure_day` solves the
+exact injected growth law for the first day the fault-induced vibration rise reaches
+an **illustrative** functional-failure level (`FAILURE_VIB_RISE = 0.45` mm/s, ≈ 5.6×
+the vibration sensor noise — a synthetic stand-in, *not* a measured engineering
+limit). RUL at day *t* is then `failure_day − t`. Spike and correlation-break faults
+have no monotone magnitude, so RUL is undefined for them and they are excluded — the
+honest scope for degradation-based RUL.
+
+The predictor **reuses the recommended detector's own risk score** — no second model
+on the raw sensors. The daily anomaly score is EWMA-smoothed (the same smoothing the
+health index uses) and expressed as a log-scale exceedance over the alert threshold
+("severity"); a one-feature log-linear model maps `log1p(RUL) = a + b·severity`.
+Critically it uses *only observable* signals and never the true onset day, so it
+reflects what would be knowable in production.
+
+Evaluation is **leave-one-machine-out**: each machine's RUL is predicted by a model
+fit only on the *other* machines, and RUL is scored only on the degradation phase
+(`onset ≤ day ≤ failure_day`) of machines whose failure is observed inside the 60-day
+window. Measured on the seed-42 fleet (6 progressive-fault machines, 90 degradation
+machine-days):
+
+| Metric | Value |
+|---|---|
+| MAE | **2.43 days** |
+| RMSE | 3.15 days |
+| Naive mean-RUL baseline MAE | 4.06 days |
+| MAE within the actionable window (true RUL ≤ 10 d) | **1.58 days** |
+| alpha-accuracy (within ±(0.5·RUL + 1 d) cone) | 0.87 |
+| Mean prognostic horizon (in-cone lead time) | 3.7 days |
+
+The severity-driven model beats the naive mean-RUL baseline by **1.63 days of MAE**
+(2.43 vs 4.06), and it is tightest where it matters — inside the last ~10 days before
+failure the mean error is 1.58 days. A single global model spans both a slower (drift)
+and a faster (accelerating) degradation law, so some of the residual is the price of
+not knowing the fault kind at inference — which is the realistic condition.
+
+The predicted-vs-true scatter (with the accuracy cone) is in
+[docs/rul_eval.svg](docs/rul_eval.svg) and the full per-machine-day held-out
+predictions are in [docs/rul_eval.csv](docs/rul_eval.csv); both are also folded into
+the PDF report (a RUL page) and the Excel workbook (a `RUL` sheet). Regenerate them
+with `python -m pdm --rul-out docs`.
+
 ## How to run
 
 ```
 pip install -r requirements.txt
-python -m pytest -q               # 29 tests
+python -m pytest -q               # 43 tests
 python -m ruff check .            # lint gate
 python -m pdm                     # run the pipeline, print the summary above
 python -m pdm --deliverables      # also write deliverables/pdm_report.pdf + pdm_workbook.xlsx
 python -m pdm --alert-econ-out docs  # regenerate docs/alert_economics.{svg,csv}
+python -m pdm --rul-out docs         # regenerate docs/rul_eval.{svg,csv}
 ```
 
 Torch note: CI installs the CPU wheel best-effort; if it is unavailable, the
@@ -129,8 +188,18 @@ autoencoder tests skip via `importorskip` and the numpy-based suite still gates.
   generator does not model. The numbers above measure the pipeline's mechanics, not
   field performance.
 - **The health index is a heuristic.** It maps the smoothed anomaly score onto 0-100.
-  It is useful for ranking urgency; it is not an RUL model and carries no calibrated
-  time-to-failure meaning.
+  It is useful for ranking urgency; it is not the RUL model and carries no calibrated
+  time-to-failure meaning. The calibrated time-to-failure estimate is the separate
+  `pdm/rul.py` layer.
+- **The RUL failure level is illustrative, and RUL only covers progressive faults.**
+  The 0.45 mm/s functional-failure level is a synthetic stand-in I chose so failures
+  land inside the observation window, not a measured engineering limit — every day
+  count scales with it, so read the RUL numbers as the *shape* of the
+  degradation-to-failure relationship, not calibrated field RUL. RUL is defined only
+  for the monotone-degradation faults (`slow_drift`, `accelerating_drift`); spike and
+  correlation-break faults have no time-to-failure target and are excluded. With only
+  six progressive machines the leave-one-machine-out estimate is honest but
+  small-sample, and the reported error would not transfer to messier real telemetry.
 - **Detection delay favours my generator.** Onsets are step changes at known days;
   real degradation onset is ambiguous, so "3.4 days after onset" would not transfer
   as-is.

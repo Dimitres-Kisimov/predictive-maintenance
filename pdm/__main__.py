@@ -19,11 +19,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="(re)write DIR/alert_economics.{csv,svg} reference artifacts (e.g. docs)",
     )
+    ap.add_argument(
+        "--rul-out",
+        default=None,
+        metavar="DIR",
+        help="(re)write DIR/rul_eval.{csv,svg} reference artifacts (e.g. docs)",
+    )
     args = ap.parse_args(argv)
 
     from pdm.alert_economics import build_reference_artifacts, economics_from_result
     from pdm.exports import build_deliverables
     from pdm.pipeline import run_pipeline
+    from pdm.rul import build_reference_artifacts as build_rul_artifacts
+    from pdm.rul import evaluate_rul
 
     print("[pdm] running pipeline on the synthetic seeded fleet (no real telemetry)")
     result = run_pipeline()
@@ -66,6 +74,22 @@ def main(argv: list[str] | None = None) -> int:
             f"{cur.alerts_per_period:.2f} alerts/day, {cur.missed_failures} missed "
             f"(synthetic data; costs illustrative, not a business guarantee)"
         )
+
+    rul = evaluate_rul(result)
+    print(
+        f"[rul] leave-one-machine-out over {rul.n_machines} progressive-fault machines "
+        f"({rul.n_samples} degradation-days): MAE {rul.mae:.2f} d, RMSE {rul.rmse:.2f} d "
+        f"(naive-mean baseline {rul.baseline_mae:.2f} d)"
+    )
+    print(
+        f"[rul] near-failure MAE (RUL<={rul.config.horizon_days}d) {rul.mae_within_horizon:.2f} d, "
+        f"alpha-accuracy {rul.alpha_accuracy:.2f} "
+        f"(ILLUSTRATIVE failure level; not calibrated field RUL)"
+    )
+
+    if args.rul_out:
+        for kind, p in build_rul_artifacts(result, args.rul_out).items():
+            print(f"[rul] wrote {kind}: {p}")
 
     if args.alert_econ_out:
         paths = build_reference_artifacts(result, args.alert_econ_out)

@@ -16,6 +16,7 @@ Same config (incl. seed) -> bit-identical output.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,9 +32,30 @@ FAULT_ACCEL = "accelerating_drift"
 
 FAULT_KINDS = (FAULT_DRIFT, FAULT_SPIKE, FAULT_CORR, FAULT_ACCEL)
 
+# Progressive-degradation faults: their injected magnitude grows monotonically
+# with time since onset, so a remaining-useful-life target is well defined for
+# them. Spike / correlation-break faults have no monotone magnitude and are
+# deliberately excluded from RUL (see pdm/rul.py and PlantData.failure_day).
+PROGRESSIVE_FAULTS = (FAULT_DRIFT, FAULT_ACCEL)
+
 _BASES = np.array([70.0, 2.0, 30.0, 5.0])  # degC, mm/s, A, bar
 _GAINS = np.array([8.0, 1.2, 12.0, 1.5])  # coupling to the latent load
 _NOISE_SD = np.array([0.5, 0.08, 0.6, 0.05])
+
+# Injected fault-growth rates. These are the SINGLE SOURCE OF TRUTH for the
+# degradation the generator applies AND for the ground-truth failure day used by
+# the RUL layer, so the two can never drift apart. Vibration (channel 1) is the
+# driving degradation signal; temperature (channel 0) rises alongside it.
+DRIFT_VIB_PER_DAY = 0.030  # mm/s of vibration rise per day after onset
+DRIFT_TEMP_PER_DAY = 0.120  # degC of temperature rise per day after onset
+ACCEL_VIB_PER_DAY2 = 0.0045  # mm/s of vibration rise per day^2 after onset
+ACCEL_TEMP_PER_DAY2 = 0.020  # degC of temperature rise per day^2 after onset
+
+# ILLUSTRATIVE "functional-failure" level: the fault-induced vibration rise (mm/s)
+# at which we declare the machine failed for RUL bookkeeping. This is a SYNTHETIC
+# stand-in chosen so failures land inside the observation window, NOT a measured
+# engineering limit. It is ~5.6x the vibration sensor noise SD (0.08 mm/s).
+FAILURE_VIB_RISE = 0.45
 
 
 @dataclass(frozen=True)
@@ -85,6 +107,32 @@ class PlantData:
                 y[lab.machine, lab.onset_day :] = 1
         return y
 
+    def failure_day(self, machine: int, vib_rise: float = FAILURE_VIB_RISE) -> int | None:
+        """Ground-truth 'functional-failure' day for a progressive-degradation machine.
+
+        Defined ONLY for slow_drift / accelerating_drift faults, whose injected
+        vibration rise grows monotonically: the first whole day on which the
+        fault-induced vibration increase reaches `vib_rise` mm/s. Solved from the
+        exact injected growth law (the same constants the generator uses), so the
+        target can never drift from the signal.
+
+        Returns None for healthy machines and for spike / correlation-break faults
+        (no monotone magnitude -> time-to-a-degradation-threshold is undefined).
+        The returned day MAY exceed n_days, meaning the failure is right-censored
+        (never observed within the window); callers decide how to treat that.
+
+        `vib_rise` is an ILLUSTRATIVE synthetic level (see FAILURE_VIB_RISE), not a
+        measured engineering limit.
+        """
+        lab = self.labels[machine]
+        if lab.fault_type == FAULT_DRIFT:
+            days_after_onset = vib_rise / DRIFT_VIB_PER_DAY
+        elif lab.fault_type == FAULT_ACCEL:
+            days_after_onset = math.sqrt(vib_rise / ACCEL_VIB_PER_DAY2)
+        else:
+            return None
+        return lab.onset_day + math.ceil(days_after_onset)
+
 
 def _ar1(rng: np.random.Generator, n: int, phi: float = 0.9) -> np.ndarray:
     return lfilter([1.0], [1.0, -phi], rng.normal(size=n))
@@ -127,11 +175,11 @@ def generate(config: DataConfig | None = None) -> PlantData:
             onset = onset_day[m]
             dsince = np.clip(day - onset, 0, None).astype(float)
             if kind == FAULT_DRIFT:
-                x[:, 1] += 0.030 * dsince
-                x[:, 0] += 0.120 * dsince
+                x[:, 1] += DRIFT_VIB_PER_DAY * dsince
+                x[:, 0] += DRIFT_TEMP_PER_DAY * dsince
             elif kind == FAULT_ACCEL:
-                x[:, 1] += 0.0045 * dsince**2
-                x[:, 0] += 0.020 * dsince**2
+                x[:, 1] += ACCEL_VIB_PER_DAY2 * dsince**2
+                x[:, 0] += ACCEL_TEMP_PER_DAY2 * dsince**2
             elif kind == FAULT_SPIKE:
                 for d in range(onset, cfg.n_days):
                     idx = d * spd + rng.choice(spd, size=3, replace=False)
