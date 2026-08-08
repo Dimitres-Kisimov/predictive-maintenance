@@ -25,11 +25,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="(re)write DIR/rul_eval.{csv,svg} reference artifacts (e.g. docs)",
     )
+    ap.add_argument(
+        "--policy-out",
+        default=None,
+        metavar="DIR",
+        help="(re)write DIR/policy_comparison.{csv,svg} reference artifacts (e.g. docs)",
+    )
     args = ap.parse_args(argv)
 
     from pdm.alert_economics import build_reference_artifacts, economics_from_result
     from pdm.exports import build_deliverables
     from pdm.pipeline import run_pipeline
+    from pdm.policy import build_reference_artifacts as build_policy_artifacts
+    from pdm.policy import compare_policies_from_result
     from pdm.rul import build_reference_artifacts as build_rul_artifacts
     from pdm.rul import evaluate_rul
 
@@ -87,9 +95,34 @@ def main(argv: list[str] | None = None) -> int:
         f"(ILLUSTRATIVE failure level; not calibrated field RUL)"
     )
 
+    cmp = compare_policies_from_result(result)
+    fit = cmp.fit
+    print(
+        f"[policy] Weibull lifetime fit ({fit.n_failures} failures + {fit.n_suspensions} "
+        f"suspensions): shape {fit.shape:.2f}, scale {fit.scale:.1f} d, MTBF {fit.mtbf:.1f} d, "
+        f"B10 {fit.b10:.1f} d (modelled, not measured)"
+    )
+    t_star = (
+        f"T*={cmp.age.optimal_age_days:.1f} d" if cmp.age.finite_optimum else "no finite T*"
+    )
+    print(
+        f"[policy] cost/machine-day: run-to-failure {cmp.rtf_cost_rate:.2f}, "
+        f"age-replacement {cmp.age.cost_rate:.2f} ({t_star}), "
+        f"condition-based {cmp.cbm_rate:.2f} "
+        f"({cmp.cbm.n_detected_in_time}/{cmp.cbm.n_failures} alerted >={cmp.cbm.lead_days} d early)"
+    )
+    print(
+        f"[policy] recommended: {cmp.recommended} "
+        f"(ILLUSTRATIVE cost rates; ranking moves with them)"
+    )
+
     if args.rul_out:
         for kind, p in build_rul_artifacts(result, args.rul_out).items():
             print(f"[rul] wrote {kind}: {p}")
+
+    if args.policy_out:
+        for kind, p in build_policy_artifacts(result, args.policy_out).items():
+            print(f"[policy] wrote {kind}: {p}")
 
     if args.alert_econ_out:
         paths = build_reference_artifacts(result, args.alert_econ_out)

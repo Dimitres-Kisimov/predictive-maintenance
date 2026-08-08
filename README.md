@@ -56,6 +56,12 @@ This repo does both, end to end.
   (`cost_missed_failure·FN + cost_false_alarm·FP`). It returns the cost-minimising
   threshold and a plain-language recommendation. The cost rates are illustrative
   synthetic assumptions, not a business figure.
+- `pdm/policy.py` — maintenance-policy economics: a right-censored Weibull
+  lifetime fit (shape/scale, MTBF, B10/B50) on the fleet's ground-truth failure
+  days, the classic **age-replacement optimization** (the cheapest preventive
+  replacement age T*), and a **condition-based** policy priced from the
+  detector's *measured* alerts — all three policies compared on cost per
+  machine-day under labelled illustrative cost rates.
 - `pdm/exports.py` — an executive PDF (cover with disclaimer, PR curves, health
   ranking, before/after Gantt, alert-economics cost curve) and an Excel workbook
   (Machines, Alerts, HealthIndex, Schedule, Comparison, AlertEconomics).
@@ -165,16 +171,73 @@ predictions are in [docs/rul_eval.csv](docs/rul_eval.csv); both are also folded 
 the PDF report (a RUL page) and the Excel workbook (a `RUL` sheet). Regenerate them
 with `python -m pdm --rul-out docs`.
 
+## Maintenance-policy comparison (Weibull + age replacement + CBM)
+
+Detection, RUL and alert thresholds all feed one final question a maintenance
+engineer actually has to answer: **which policy do we run this fleet on?**
+`pdm/policy.py` prices three named policies on the same synthetic fleet.
+
+**Lifetime model.** Machine lives come from the generator's ground-truth
+functional-failure day (the same illustrative vibration-rise definition the RUL
+layer uses). On the seed-42 fleet that gives **6 observed failures** (days 43,
+45, 47, 49, 50, 51) and **14 suspensions** right-censored at the 60-day window
+end — the standard field-data "failures + suspensions" situation. A
+two-parameter Weibull fit by censored maximum likelihood gives:
+
+| Weibull fit (MLE) | Value |
+|---|---|
+| shape β | **4.81** (β > 1: wear-out — preventive action can pay) |
+| scale η | 73.6 days |
+| MTBF | 67.4 days |
+| B10 life | 46.1 days |
+| B50 (median) life | 68.2 days |
+
+These are **modelled, not measured**: one heavily censored synthetic window,
+six failures. The fit's own MLE identities and its likelihood optimality are
+test-verified; the numbers' field meaning is not claimed.
+
+**Policy pricing** (illustrative cost rates, consistent with the
+alert-economics section: unplanned failure 1000, planned replacement 250,
+false-alarm inspection 50 — labelled assumptions, not currency):
+
+| Policy | Cost / machine-day | Detail |
+|---|---|---|
+| Run-to-failure | 14.84 | Cf / MTBF baseline |
+| **Age-replacement** | **7.16** | replace at **T\* = 44.4 d** (−51.7% vs run-to-failure) |
+| Condition-based | 8.28 | 6/6 failures alerted ≥ 3 d early; +4.57/machine-day false-alarm inspections |
+
+Under these assumptions the recommendation is **age-replacement**, and the
+result is honest about why the fancier option loses: the detector converts
+*every* failure into a planned repair (6/6 alerted with ≥ 3 days of lead time),
+but at the default 5%-FPR threshold its 0.091 false alarms per machine-day book
+4.57 of the 8.28 — more than half the policy's cost — in inspections. Meanwhile
+β ≈ 4.8 means failures cluster tightly around the characteristic life, which is
+exactly the regime where a calendar rule is hard to beat (note T* ≈ B10: replace
+just before the wear-out knee). With real fleets' messier lifetime scatter
+(lower β) or a better-tuned alert threshold the ranking can flip — the point of
+the module is that the trade-off is *computed*, not asserted.
+
+The textbook base case is also test-verified: for memoryless (β = 1) lifetimes
+the optimizer reports that **no** finite replacement age beats run-to-failure,
+exactly as renewal theory says it must.
+
+The cost-rate curve g(T) with all three policies is drawn in
+[docs/policy_comparison.svg](docs/policy_comparison.svg) and the full
+comparison + curve is in
+[docs/policy_comparison.csv](docs/policy_comparison.csv). Regenerate with
+`python -m pdm --policy-out docs`.
+
 ## How to run
 
 ```
 pip install -r requirements.txt
-python -m pytest -q               # 43 tests
+python -m pytest -q               # 63 tests
 python -m ruff check .            # lint gate
 python -m pdm                     # run the pipeline, print the summary above
 python -m pdm --deliverables      # also write deliverables/pdm_report.pdf + pdm_workbook.xlsx
 python -m pdm --alert-econ-out docs  # regenerate docs/alert_economics.{svg,csv}
 python -m pdm --rul-out docs         # regenerate docs/rul_eval.{svg,csv}
+python -m pdm --policy-out docs      # regenerate docs/policy_comparison.{svg,csv}
 ```
 
 Torch note: CI installs the CPU wheel best-effort; if it is unavailable, the
@@ -206,6 +269,16 @@ autoencoder tests skip via `importorskip` and the numpy-based suite still gates.
 - **The scheduling model is deliberately small** — single-day jobs, uniform crews,
   no travel time or parts inventory. CP-SAT handles richer models, but I kept the
   instance small enough to prove optimality.
+- **The policy comparison is a modelled planning exercise, not a certified
+  policy.** The Weibull fit rests on six synthetic failures plus fourteen
+  suspensions from one observation window, so MTBF and the B-lives are model
+  extrapolations with real small-sample uncertainty (no confidence bounds are
+  reported). The three cost rates are illustrative assumptions and the policy
+  ranking moves with them. The condition-based price divides the per-cycle cost
+  by the mean life (ignoring the slightly shortened cycle when a repair happens
+  a few days early) and assumes every alert with ≥ 3 days of lead time converts
+  the failure into a planned repair — both stated simplifications. Swap in
+  measured lifetimes and verified costs before treating any of it as a decision.
 - **The alert-economics cost rates are illustrative.** The 20:1 missed-failure /
   false-alarm ratio is a stand-in I chose to show the shape of the trade-off, not a
   measured business figure, and the "cost" units are not currency. The recommended
